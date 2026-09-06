@@ -12,7 +12,7 @@ def _require(name: str) -> str:
 
 
 GROQ_API_KEY = _require("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama3-8b-8192")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
 PINECONE_API_KEY = _require("PINECONE_API_KEY")
 PINECONE_INDEX = os.getenv("PINECONE_INDEX", "ai-news-assistant")
