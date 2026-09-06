@@ -1,0 +1,38 @@
+.feed { padding: 20px 24px; }
+
+.feed-header {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 20px; gap: 16px; flex-wrap: wrap;
+}
+.feed-title { font-size: 1.2rem; font-weight: 700; color: #e8eaf6; }
+
+.search-form { display: flex; gap: 6px; }
+.search-input {
+  padding: 8px 14px; border-radius: 8px;
+  border: 1.5px solid #2a2f5a; background: #13162a;
+  color: #e8eaf6; font-size: .85rem; outline: none; width: 200px;
+  transition: border .15s;
+}
+.search-input:focus { border-color: #4f6ef7; }
+.search-btn {
+  padding: 8px 14px; border-radius: 8px;
+  background: #4f6ef7; border: none; color: #fff;
+  cursor: pointer; font-size: .9rem; transition: opacity .15s;
+}
+.search-btn:hover:not(:disabled) { opacity: .85; }
+
+.feed-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 16px;
+}
+
+.feed-loading { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; }
+.skeleton {
+  height: 200px; border-radius: 12px;
+  background: linear-gradient(90deg, #1a1d2e 25%, #22264a 50%, #1a1d2e 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.4s infinite;
+}
+@keyframes shimmer { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
+.feed-empty { text-align: center; padding: 60px 0; color: #4a5580; font-size: .9rem; }
