@@ -18,6 +18,8 @@ services:
         value: aws
       - key: PINECONE_REGION
         value: us-east-1
+      - key: NEWSAPI_KEY
+        sync: false
       - key: GNEWS_API_KEY
         sync: false
       - key: EMBEDDING_MODEL
