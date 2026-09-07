@@ -1,9 +1,9 @@
-"""
-Conversational AI agent using Groq SDK directly.
-Uses a custom action format that Groq won't intercept as tool calls.
+﻿"""
+Conversational AI agent — no tool calling API used at all.
+We detect intent from the user message, fetch data directly,
+then pass it to the LLM as context. Zero tool schemas, zero interception.
 """
 
-import json
 import re
 from datetime import datetime
 
@@ -13,112 +13,134 @@ from app.config import GROQ_API_KEY, GROQ_MODEL
 
 client = Groq(api_key=GROQ_API_KEY)
 
+STOCK_SYMBOLS = {
+    "nvidia": "NVDA", "nvda": "NVDA", "apple": "AAPL", "aapl": "AAPL",
+    "tesla": "TSLA", "tsla": "TSLA", "microsoft": "MSFT", "msft": "MSFT",
+    "google": "GOOGL", "alphabet": "GOOGL", "amazon": "AMZN", "amzn": "AMZN",
+    "meta": "META", "reliance": "RELIANCE.NS", "tcs": "TCS.NS",
+    "infosys": "INFY.NS", "wipro": "WIPRO.NS", "nifty": "^NSEI",
+    "sensex": "^BSESN", "nse": "^NSEI", "bse": "^BSESN",
+}
 
-def _system_prompt() -> str:
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    return f"""You are an intelligent personal AI news and information assistant. Current time: {now}.
-
-When you need to fetch information, output an ACTION block like this (and nothing else):
-
-ACTION: search_news | query=your search term
-ACTION: get_category_news | category=technology
-ACTION: get_stock | symbol=NVDA
-
-Valid categories: general, technology, business, science, health, sports, entertainment, world
-
-Rules:
-- For news/current events questions -> output ACTION: get_category_news
-- For specific person/topic searches -> output ACTION: search_news
-- For stock price questions -> output ACTION: get_stock
-- After getting results, give a clear concise answer
-- For general knowledge, answer directly without an ACTION
-- Never mix ACTION and text in the same response
-- Only output one ACTION per response"""
-
-
-def _extract_action(text: str) -> dict | None:
-    text = text.strip()
-    match = re.search(r'ACTION:\s*(\w+)\s*\|(.+)', text)
-    if not match:
-        return None
-    name = match.group(1).strip()
-    params_str = match.group(2).strip()
-    params = {}
-    for part in params_str.split('|'):
-        if '=' in part:
-            k, v = part.split('=', 1)
-            params[k.strip()] = v.strip()
-    return {"tool": name, "params": params}
+CATEGORY_KEYWORDS = {
+    "technology": ["tech", "ai", "software", "computer", "robot", "startup", "app",
+                   "gadget", "phone", "laptop", "internet", "cyber", "digital", "isro",
+                   "nasa", "space", "satellite", "rocket"],
+    "business":   ["business", "economy", "market", "trade", "company", "corporate",
+                   "crochet", "industry", "commerce", "gdp", "entrepreneur"],
+    "science":    ["science", "research", "experiment", "discovery", "biology",
+                   "physics", "chemistry", "isro", "nasa", "space", "climate"],
+    "health":     ["health", "medical", "doctor", "hospital", "disease", "medicine",
+                   "vaccine", "mental", "fitness", "diet", "nutrition"],
+    "sports":     ["sport", "cricket", "football", "ipl", "match", "player", "team",
+                   "tournament", "olympic", "fifa", "tennis", "basketball"],
+    "entertainment": ["movie", "film", "music", "celebrity", "bollywood", "hollywood",
+                      "actor", "singer", "show", "series", "netflix", "award"],
+    "world":      ["world", "global", "international", "country", "war", "peace",
+                   "politics", "president", "minister", "election", "india"],
+    "general":    [],
+}
 
 
-async def _run_action(action: dict) -> str:
-    name = action.get("tool", "")
-    params = action.get("params", {})
-    try:
-        if name == "search_news":
-            from app.news import search_news
-            articles = await search_news(params.get("query", ""), max_articles=5)
-            if not articles:
-                return "No news found for that query."
-            return "\n".join(f"- {a['title']} ({a['source']}): {a['description']}" for a in articles)
-
-        elif name == "get_category_news":
-            from app.news import fetch_top_news
-            from app.rag import store_articles
-            cat = params.get("category", "general")
-            articles = await fetch_top_news(cat, max_articles=6)
-            try:
-                store_articles(articles)
-            except Exception:
-                pass
-            return "\n".join(f"- {a['title']} ({a['source']}): {a['description']}" for a in articles)
-
-        elif name == "get_stock":
-            from app.stocks import get_stock_quote
-            q = await get_stock_quote(params.get("symbol", "AAPL"))
-            if q.get("error"):
-                return f"Could not fetch {q['symbol']}: {q['error']}"
-            sign = "+" if q["change"] >= 0 else ""
-            return f"{q['name']} ({q['symbol']}): {q['currency']} {q['price']} ({sign}{q['change']}, {sign}{q['change_pct']}%)"
-
-        return f"Unknown action: {name}"
-    except Exception as e:
-        return f"Action error: {e}"
+def _detect_category(text):
+    lower = text.lower()
+    for cat, keywords in CATEGORY_KEYWORDS.items():
+        if any(k in lower for k in keywords):
+            return cat
+    return "general"
 
 
-async def chat(messages_history: list[dict], user_message: str) -> str:
-    # RAG context
-    rag_context = ""
+def _detect_stock_symbol(text):
+    lower = text.lower()
+    for keyword, symbol in STOCK_SYMBOLS.items():
+        if keyword in lower:
+            return symbol
+    match = re.search(r'\b([A-Z]{2,5})\b', text)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _is_stock_question(text):
+    lower = text.lower()
+    stock_words = ["stock", "price", "share", "market cap", "trading", "invest",
+                   "bull", "bear", "portfolio", "equity", "nasdaq", "nyse",
+                   "nifty", "sensex", "nse", "bse"]
+    return any(w in lower for w in stock_words) or _detect_stock_symbol(text) is not None
+
+
+async def _fetch_context(user_message):
+    context_parts = []
+
     try:
         from app.rag import retrieve_relevant
         docs = retrieve_relevant(user_message, top_k=3)
         if docs:
-            rag_context = "\n\nRelevant from knowledge base:\n" + "\n".join(
-                f"- {d['title']}: {d['description']}" for d in docs
-            )
+            context_parts.append("Relevant articles from knowledge base:\n" + "\n".join(
+                f"- {d['title']} ({d['source']}): {d['description']}" for d in docs
+            ))
     except Exception:
         pass
 
-    messages = [{"role": "system", "content": _system_prompt() + rag_context}]
+    if _is_stock_question(user_message):
+        symbol = _detect_stock_symbol(user_message)
+        if symbol:
+            try:
+                from app.stocks import get_stock_quote
+                q = await get_stock_quote(symbol)
+                if not q.get("error"):
+                    sign = "+" if q["change"] >= 0 else ""
+                    context_parts.append(
+                        f"Stock data: {q['name']} ({q['symbol']}) = "
+                        f"{q['currency']} {q['price']} "
+                        f"({sign}{q['change']}, {sign}{q['change_pct']}%)"
+                    )
+            except Exception:
+                pass
+
+    try:
+        from app.news import fetch_top_news, search_news
+        from app.rag import store_articles
+        articles = await search_news(user_message, max_articles=4)
+        if not articles or all(a["url"] == "#" for a in articles):
+            cat = _detect_category(user_message)
+            articles = await fetch_top_news(cat, max_articles=5)
+        if articles:
+            try:
+                store_articles(articles)
+            except Exception:
+                pass
+            context_parts.append("Current news articles:\n" + "\n".join(
+                f"- {a['title']} ({a['source']}): {a['description']}"
+                for a in articles
+            ))
+    except Exception:
+        pass
+
+    return "\n\n".join(context_parts)
+
+
+async def chat(messages_history, user_message):
+    context = await _fetch_context(user_message)
+
+    system = f"""You are an intelligent personal AI news and information assistant.
+Current time: {datetime.now().strftime("%Y-%m-%d %H:%M")}.
+
+Answer the user's question using the context below. Be clear, concise and helpful.
+If the context has relevant information use it. Otherwise use your general knowledge.
+Always cite sources when available.
+
+{context}"""
+
+    messages = [{"role": "system", "content": system}]
     for m in messages_history[-10:]:
         messages.append({"role": m["role"], "content": m["content"]})
     messages.append({"role": "user", "content": user_message})
 
-    for _ in range(4):
-        response = client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=messages,
-            temperature=0.3,
-            max_tokens=1024,
-        )
-        content = response.choices[0].message.content or ""
-        messages.append({"role": "assistant", "content": content})
-
-        action = _extract_action(content)
-        if not action:
-            return content.strip() or "I couldn't process that request."
-
-        result = await _run_action(action)
-        messages.append({"role": "user", "content": f"Results:\n{result}"})
-
-    return "I reached the maximum steps. Please try a more specific question."
+    response = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=messages,
+        temperature=0.4,
+        max_tokens=1024,
+    )
+    return response.choices[0].message.content or "I could not generate a response."
