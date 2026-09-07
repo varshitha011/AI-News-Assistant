@@ -1,4 +1,6 @@
-"""Conversational AI agent with RAG, news search, and stock lookup."""
+"""Conversational AI agent with RAG, news search, and stock lookup.
+Uses prompt-based tool calling — no bind_tools — to avoid Groq API tool_use errors.
+"""
 
 import json
 import re
@@ -9,6 +11,7 @@ from langchain_groq import ChatGroq
 
 from app.config import GROQ_API_KEY, GROQ_MODEL
 
+# Plain LLM — NO bind_tools
 llm = ChatGroq(api_key=GROQ_API_KEY, model=GROQ_MODEL, temperature=0.3)
 
 
@@ -16,40 +19,45 @@ def _system_prompt() -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     return f"""You are an intelligent personal AI news and information assistant. Current time: {now}.
 
-You have access to tools. Call them by responding ONLY with valid JSON (no other text):
+You can call tools by responding with ONLY a JSON object (no other text, no markdown):
 
-1. Search news:
-{{"tool": "search_news", "args": {{"query": "search term"}}}}
+Search news by keyword:
+{{"tool": "search_news", "args": {{"query": "your search term"}}}}
 
-2. Get stock quote:
-{{"tool": "get_stock", "args": {{"symbol": "NVDA"}}}}
-
-3. Get news by category:
+Get news by category:
 {{"tool": "get_category_news", "args": {{"category": "technology"}}}}
 
-Categories: general, technology, business, science, health, sports, entertainment, world
+Get stock price:
+{{"tool": "get_stock", "args": {{"symbol": "NVDA"}}}}
 
-After receiving tool results, provide a clear, concise answer.
-- For news questions: summarize key facts, cite sources
-- For stock questions: give price, change, and brief context
-- Support multi-turn conversation (remember context)
-- If no tool needed, answer directly from your knowledge
-- Always be factual, clear, and brief"""
+Valid categories: general, technology, business, science, health, sports, entertainment, world
+
+Rules:
+- If the user asks about news, current events, or topics → call get_category_news or search_news
+- If the user asks about a stock or company price → call get_stock
+- After receiving tool results, give a clear, concise answer
+- Support multi-turn conversation — remember context from earlier messages
+- If no tool is needed, answer directly
+- Never output tool JSON and text at the same time — one or the other"""
 
 
 def _extract_tool_call(text: str) -> dict | None:
+    """Extract JSON tool call from model response."""
+    text = text.strip()
+    # Try direct parse first
+    try:
+        d = json.loads(text)
+        if "tool" in d:
+            return d
+    except Exception:
+        pass
+    # Try finding JSON block in text
     match = re.search(r'\{[^{}]*"tool"[^{}]*\}', text, re.DOTALL)
     if match:
         try:
             return json.loads(match.group())
         except Exception:
             pass
-    try:
-        d = json.loads(text.strip())
-        if "tool" in d:
-            return d
-    except Exception:
-        pass
     return None
 
 
@@ -61,7 +69,21 @@ async def _run_tool(name: str, args: dict) -> str:
             if not articles:
                 return "No news found for that query."
             return "\n\n".join(
-                f"**{a['title']}** ({a['source']})\n{a['description']}\nURL: {a['url']}"
+                f"- {a['title']} ({a['source']}): {a['description']}"
+                for a in articles
+            )
+
+        elif name == "get_category_news":
+            from app.news import fetch_top_news
+            from app.rag import store_articles
+            cat = args.get("category", "general")
+            articles = await fetch_top_news(cat, max_articles=6)
+            try:
+                store_articles(articles)
+            except Exception:
+                pass
+            return "\n\n".join(
+                f"- {a['title']} ({a['source']}): {a['description']}"
                 for a in articles
             )
 
@@ -73,18 +95,6 @@ async def _run_tool(name: str, args: dict) -> str:
             sign = "+" if q["change"] >= 0 else ""
             return (f"{q['name']} ({q['symbol']}): {q['currency']} {q['price']} "
                     f"({sign}{q['change']}, {sign}{q['change_pct']}%)")
-
-        elif name == "get_category_news":
-            from app.news import fetch_top_news
-            from app.rag import store_articles, retrieve_relevant
-            cat = args.get("category", "general")
-            articles = await fetch_top_news(cat, max_articles=8)
-            store_articles(articles)
-            return "\n\n".join(
-                f"**{a['title']}** ({a['source']})\n{a['description']}"
-                for a in articles[:5]
-            )
-
         else:
             return f"Unknown tool: {name}"
     except Exception as e:
@@ -92,24 +102,20 @@ async def _run_tool(name: str, args: dict) -> str:
 
 
 async def chat(messages_history: list[dict], user_message: str) -> str:
-    """
-    messages_history: list of {"role": "user"|"assistant", "content": str}
-    Returns the assistant's reply string.
-    """
-    # Also try RAG retrieval for context
+    # Try RAG retrieval for context
     rag_context = ""
     try:
         from app.rag import retrieve_relevant
         docs = retrieve_relevant(user_message, top_k=3)
         if docs:
-            rag_context = "\n\nRelevant news from knowledge base:\n" + "\n".join(
+            rag_context = "\n\nRelevant articles from knowledge base:\n" + "\n".join(
                 f"- {d['title']} ({d['source']}): {d['description']}" for d in docs
             )
     except Exception:
         pass
 
     msgs = [SystemMessage(content=_system_prompt() + rag_context)]
-    for m in messages_history[-10:]:  # keep last 10 turns for context
+    for m in messages_history[-10:]:
         if m["role"] == "user":
             msgs.append(HumanMessage(content=m["content"]))
         else:
@@ -123,7 +129,7 @@ async def chat(messages_history: list[dict], user_message: str) -> str:
 
         tool_call = _extract_tool_call(content)
         if not tool_call:
-            return content.strip()
+            return content.strip() or "I couldn't process that request."
 
         result = await _run_tool(tool_call.get("tool", ""), tool_call.get("args", {}))
         msgs.append(HumanMessage(content=f"Tool result:\n{result}"))
