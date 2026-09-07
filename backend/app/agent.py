@@ -1,7 +1,6 @@
 """
-Conversational AI agent using Groq SDK directly — no LangChain LLM wrapper.
-This avoids the tool_use_failed error caused by langchain-groq auto-injecting
-tool schemas into the API request.
+Conversational AI agent using Groq SDK directly.
+Uses a custom action format that Groq won't intercept as tool calls.
 """
 
 import json
@@ -19,59 +18,54 @@ def _system_prompt() -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     return f"""You are an intelligent personal AI news and information assistant. Current time: {now}.
 
-You can use tools by responding with ONLY a JSON object and nothing else:
+When you need to fetch information, output an ACTION block like this (and nothing else):
 
-To search news by keyword:
-{{"tool": "search_news", "query": "your search term"}}
-
-To get news by category:
-{{"tool": "get_category_news", "category": "technology"}}
-
-To get stock price:
-{{"tool": "get_stock", "symbol": "NVDA"}}
+ACTION: search_news | query=your search term
+ACTION: get_category_news | category=technology
+ACTION: get_stock | symbol=NVDA
 
 Valid categories: general, technology, business, science, health, sports, entertainment, world
 
 Rules:
-- For news questions → respond with the get_category_news JSON
-- For specific topic searches → respond with search_news JSON
-- For stock questions → respond with get_stock JSON
-- After getting tool results, give a clear concise answer in plain text
-- For general knowledge questions, answer directly without using a tool
-- Never mix JSON and text in the same response"""
+- For news/current events questions -> output ACTION: get_category_news
+- For specific person/topic searches -> output ACTION: search_news
+- For stock price questions -> output ACTION: get_stock
+- After getting results, give a clear concise answer
+- For general knowledge, answer directly without an ACTION
+- Never mix ACTION and text in the same response
+- Only output one ACTION per response"""
 
 
-def _extract_tool_call(text: str) -> dict | None:
+def _extract_action(text: str) -> dict | None:
     text = text.strip()
-    try:
-        d = json.loads(text)
-        if "tool" in d:
-            return d
-    except Exception:
-        pass
-    match = re.search(r'\{[^{}]*"tool"[^{}]*\}', text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group())
-        except Exception:
-            pass
-    return None
+    match = re.search(r'ACTION:\s*(\w+)\s*\|(.+)', text)
+    if not match:
+        return None
+    name = match.group(1).strip()
+    params_str = match.group(2).strip()
+    params = {}
+    for part in params_str.split('|'):
+        if '=' in part:
+            k, v = part.split('=', 1)
+            params[k.strip()] = v.strip()
+    return {"tool": name, "params": params}
 
 
-async def _run_tool(call: dict) -> str:
-    name = call.get("tool", "")
+async def _run_action(action: dict) -> str:
+    name = action.get("tool", "")
+    params = action.get("params", {})
     try:
         if name == "search_news":
             from app.news import search_news
-            articles = await search_news(call.get("query", ""), max_articles=5)
+            articles = await search_news(params.get("query", ""), max_articles=5)
             if not articles:
-                return "No news found."
+                return "No news found for that query."
             return "\n".join(f"- {a['title']} ({a['source']}): {a['description']}" for a in articles)
 
         elif name == "get_category_news":
             from app.news import fetch_top_news
             from app.rag import store_articles
-            cat = call.get("category", "general")
+            cat = params.get("category", "general")
             articles = await fetch_top_news(cat, max_articles=6)
             try:
                 store_articles(articles)
@@ -81,15 +75,15 @@ async def _run_tool(call: dict) -> str:
 
         elif name == "get_stock":
             from app.stocks import get_stock_quote
-            q = await get_stock_quote(call.get("symbol", "AAPL"))
+            q = await get_stock_quote(params.get("symbol", "AAPL"))
             if q.get("error"):
                 return f"Could not fetch {q['symbol']}: {q['error']}"
             sign = "+" if q["change"] >= 0 else ""
             return f"{q['name']} ({q['symbol']}): {q['currency']} {q['price']} ({sign}{q['change']}, {sign}{q['change_pct']}%)"
 
-        return f"Unknown tool: {name}"
+        return f"Unknown action: {name}"
     except Exception as e:
-        return f"Tool error: {e}"
+        return f"Action error: {e}"
 
 
 async def chat(messages_history: list[dict], user_message: str) -> str:
@@ -106,8 +100,6 @@ async def chat(messages_history: list[dict], user_message: str) -> str:
         pass
 
     messages = [{"role": "system", "content": _system_prompt() + rag_context}]
-
-    # Add conversation history (last 10 turns)
     for m in messages_history[-10:]:
         messages.append({"role": m["role"], "content": m["content"]})
     messages.append({"role": "user", "content": user_message})
@@ -122,11 +114,11 @@ async def chat(messages_history: list[dict], user_message: str) -> str:
         content = response.choices[0].message.content or ""
         messages.append({"role": "assistant", "content": content})
 
-        tool_call = _extract_tool_call(content)
-        if not tool_call:
+        action = _extract_action(content)
+        if not action:
             return content.strip() or "I couldn't process that request."
 
-        result = await _run_tool(tool_call)
-        messages.append({"role": "user", "content": f"Tool result:\n{result}"})
+        result = await _run_action(action)
+        messages.append({"role": "user", "content": f"Results:\n{result}"})
 
     return "I reached the maximum steps. Please try a more specific question."
